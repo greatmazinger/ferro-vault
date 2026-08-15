@@ -17,3 +17,7 @@ target/
 
 # Local IDE configuration
 .antigravitycli/
+
+# Manually provisioned container rootfs (BusyBox binary, device nodes) —
+# see README's "Root filesystem provisioning" section.
+/rootfs/

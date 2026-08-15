@@ -1,9 +1,9 @@
 use nix::fcntl::{fcntl, FcntlArg, SealFlag};
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use nix::sys::wait::waitpid;
-use nix::unistd::{execvp, fork, lseek, read, write, ForkResult, Whence};
+use nix::unistd::{chdir, execvp, fork, lseek, pivot_root, read, write, ForkResult, Whence};
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Read;
@@ -11,6 +11,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 
 const CGROUP_PATH: &str = "/sys/fs/cgroup/ferrovault";
+const ROOTFS_PATH: &str = "/workspace/rootfs";
 
 struct CgroupLimits {
     memory_max_bytes: u64,
@@ -201,8 +202,81 @@ fn setup_namespaces_and_spawn() {
     }
 }
 
+fn pivot_to_rootfs() {
+    // pivot_root(2) requires the new root to be a mount point distinct from
+    // its parent. Bind-mounting the rootfs onto itself satisfies that
+    // without needing a real second filesystem or partition.
+    if let Err(e) = mount(
+        Some(ROOTFS_PATH),
+        ROOTFS_PATH,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REC,
+        None::<&str>,
+    ) {
+        eprintln!("Container: failed to bind-mount rootfs: {}", e);
+        std::process::exit(1);
+    }
+
+    // put_old must be a directory under the new root. Created fresh each
+    // run and removed below — nothing persists between runs.
+    let put_old = format!("{}/.oldroot", ROOTFS_PATH);
+    if let Err(e) = fs::create_dir_all(&put_old) {
+        eprintln!("Container: failed to create pivot_root put_old dir: {}", e);
+        std::process::exit(1);
+    }
+
+    if let Err(e) = chdir(ROOTFS_PATH) {
+        eprintln!("Container: chdir into rootfs failed: {}", e);
+        std::process::exit(1);
+    }
+
+    // put_old is given relative to the new root (our new cwd).
+    if let Err(e) = pivot_root(".", ".oldroot") {
+        eprintln!("Container: pivot_root failed: {}", e);
+        std::process::exit(1);
+    }
+
+    if let Err(e) = chdir("/") {
+        eprintln!("Container: chdir to new / failed: {}", e);
+        std::process::exit(1);
+    }
+
+    // Lazily detach the old root — it vanishes from this namespace immediately.
+    if let Err(e) = umount2("/.oldroot", MntFlags::MNT_DETACH) {
+        eprintln!("Container: failed to unmount old root: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = fs::remove_dir("/.oldroot") {
+        eprintln!("Container: failed to remove old root mountpoint: {}", e);
+        std::process::exit(1);
+    }
+
+    // Lock the new root read-only now that nothing references the old one.
+    // Remounting is a required second, separate mount(2) call — MS_BIND
+    // ignores MS_RDONLY when set on the same call that creates the bind.
+    // Doing this last (after the .oldroot cleanup above) matters: if the
+    // root were already read-only, rmdir("/.oldroot") would fail.
+    if let Err(e) = mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | MsFlags::MS_REC,
+        None::<&str>,
+    ) {
+        eprintln!("Container: failed to remount rootfs read-only: {}", e);
+        std::process::exit(1);
+    }
+
+    println!(
+        "Container: pivoted into isolated rootfs at {} (now read-only).",
+        ROOTFS_PATH
+    );
+}
+
 fn execute_container_payload() {
     println!("Container: Entered new PID namespace. I am PID 1.");
+
+    pivot_to_rootfs();
 
     // Overmount /proc with a fresh procfs scoped to this PID namespace.
     // MS_NOSUID/NODEV/NOEXEC are the standard hardening flags for procfs —
@@ -236,10 +310,10 @@ fn execute_container_payload() {
     }
     println!();
 
-    // fd intentionally left open: bash inherits it, verifiable via
+    // fd intentionally left open: sh inherits it, verifiable via
     // `ls -la /proc/1/fd` inside the container
-    let command = CString::new("bash").unwrap();
-    let args = [CString::new("bash").unwrap()];
+    let command = CString::new("/bin/sh").unwrap();
+    let args = [CString::new("/bin/sh").unwrap()];
 
     let e = execvp(&command, &args).unwrap_err();
     eprintln!("Container: execvp failed: {}", e);
