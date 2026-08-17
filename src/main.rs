@@ -4,7 +4,7 @@ use nix::sched::{unshare, CloneFlags};
 use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
 use nix::sys::wait::waitpid;
 use nix::unistd::{chdir, execvp, fork, lseek, pivot_root, read, write, ForkResult, Whence};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::io::Read;
 use std::os::fd::OwnedFd;
@@ -13,6 +13,7 @@ use std::os::unix::io::AsRawFd;
 const CGROUP_PATH: &str = "/sys/fs/cgroup/ferrovault";
 const ROOTFS_PATH: &str = "/workspace/rootfs";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CgroupLimits {
     memory_max_bytes: u64,
     cpu_quota_us: u64,
@@ -31,13 +32,28 @@ impl Default for CgroupLimits {
     }
 }
 
+impl CgroupLimits {
+    /// (cgroup control-file name, value to write) pairs for this limit set.
+    /// Pure data shaping — no I/O. `setup_cgroup` performs the actual writes.
+    fn cgroup_writes(&self) -> [(&'static str, String); 3] {
+        [
+            ("memory.max", self.memory_max_bytes.to_string()),
+            (
+                "cpu.max",
+                format!("{} {}", self.cpu_quota_us, self.cpu_period_us),
+            ),
+            ("pids.max", self.pids_max.to_string()),
+        ]
+    }
+}
+
 fn main() {
     println!("=== FerroVault Manager Starting ===");
 
     let identity_fd = provision_identity();
     std::env::set_var("FERROVAULT_IDENTITY_FD", identity_fd.as_raw_fd().to_string());
 
-    setup_cgroup(&CgroupLimits::default());
+    let cgroup_guard = setup_cgroup(&CgroupLimits::default());
 
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
@@ -46,19 +62,39 @@ fn main() {
                 Ok(status) => println!("Manager: Container exited with status: {:?}", status),
                 Err(e) => eprintln!("Manager: waitpid error: {}", e),
             }
-            cleanup_cgroup();
+            // cgroup_guard drops here, removing the cgroup directory.
         }
         Ok(ForkResult::Child) => {
+            // cgroup_guard's Drop never runs in this process: every path out
+            // of setup_namespaces_and_spawn() ends in process::exit() or
+            // execvp(), both of which skip destructors — intentional, since
+            // only the manager (parent) should ever remove the cgroup.
             setup_namespaces_and_spawn();
         }
         Err(e) => {
             eprintln!("Manager: fork failed: {}", e);
+            // process::exit() skips destructors too, so without this the
+            // cgroup directory created above would leak on this path.
+            drop(cgroup_guard);
             std::process::exit(1);
         }
     }
 }
 
-fn setup_cgroup(limits: &CgroupLimits) {
+/// Owns the manager's membership of the FerroVault cgroup. Its `Drop` impl
+/// is the only thing that removes `CGROUP_PATH` — binding this to a named
+/// variable guarantees cleanup runs even if a panic unwinds past the point
+/// where cleanup used to be called explicitly.
+#[must_use = "dropping this immediately removes the cgroup directory"]
+struct CgroupGuard;
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        cleanup_cgroup();
+    }
+}
+
+fn setup_cgroup(limits: &CgroupLimits) -> CgroupGuard {
     // Enable controllers in the parent cgroup so child cgroups can use them.
     // Best-effort: inside a container the root cgroup may restrict this.
     if let Err(e) = fs::write(
@@ -70,23 +106,16 @@ fn setup_cgroup(limits: &CgroupLimits) {
 
     fs::create_dir_all(CGROUP_PATH).expect("create cgroup directory");
 
-    let writes: &[(&str, String)] = &[
-        ("memory.max", limits.memory_max_bytes.to_string()),
-        (
-            "cpu.max",
-            format!("{} {}", limits.cpu_quota_us, limits.cpu_period_us),
-        ),
-        ("pids.max", limits.pids_max.to_string()),
-    ];
-
-    for (file, value) in writes {
-        match fs::write(format!("{}/{}", CGROUP_PATH, file), value) {
+    for (file, value) in limits.cgroup_writes() {
+        match fs::write(format!("{}/{}", CGROUP_PATH, file), &value) {
             Ok(_) => println!("Manager:   {} = {}", file, value),
             Err(e) => eprintln!("Manager:   {} (skipped): {}", file, e),
         }
     }
 
     println!("Manager: Cgroup ready at {}.", CGROUP_PATH);
+
+    CgroupGuard
 }
 
 fn cleanup_cgroup() {
@@ -109,11 +138,8 @@ fn provision_identity() -> OwnedFd {
 
     // Anonymous in-RAM file. MFD_ALLOW_SEALING enables F_ADD_SEALS below.
     // No MFD_CLOEXEC: the fd must survive execvp so the container inherits it.
-    let fd = memfd_create(
-        CStr::from_bytes_with_nul(b"ferrovault-identity\0").unwrap(),
-        MemFdCreateFlag::MFD_ALLOW_SEALING,
-    )
-    .expect("memfd_create failed");
+    let fd = memfd_create(c"ferrovault-identity", MemFdCreateFlag::MFD_ALLOW_SEALING)
+        .expect("memfd_create failed");
 
     write(&fd, &identity).expect("write identity to memfd");
 
@@ -304,11 +330,7 @@ fn execute_container_payload() {
     read(fd_num, &mut identity).expect("read identity from memfd");
 
     // Print as hex — proves the sealed identity was received intact
-    print!("Container: Identity received — 0x");
-    for byte in &identity {
-        print!("{:02x}", byte);
-    }
-    println!();
+    println!("Container: Identity received — 0x{}", to_hex(&identity));
 
     // fd intentionally left open: sh inherits it, verifiable via
     // `ls -la /proc/1/fd` inside the container
@@ -318,4 +340,78 @@ fn execute_container_payload() {
     let e = execvp(&command, &args).unwrap_err();
     eprintln!("Container: execvp failed: {}", e);
     std::process::exit(1);
+}
+
+/// Lowercase, zero-padded hex encoding, e.g. `[0x02, 0xff]` -> "02ff".
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_cgroup_limits_match_documented_values() {
+        let d = CgroupLimits::default();
+        assert_eq!(d.memory_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(d.cpu_quota_us, 50_000);
+        assert_eq!(d.cpu_period_us, 100_000);
+        assert_eq!(d.pids_max, 32);
+    }
+
+    #[test]
+    fn cgroup_writes_has_expected_files_and_order() {
+        let writes = CgroupLimits::default().cgroup_writes();
+        let names: Vec<&str> = writes.iter().map(|(f, _)| *f).collect();
+        assert_eq!(names, ["memory.max", "cpu.max", "pids.max"]);
+    }
+
+    #[test]
+    fn cpu_max_formats_quota_and_period_space_separated() {
+        let limits = CgroupLimits {
+            cpu_quota_us: 50_000,
+            cpu_period_us: 100_000,
+            ..CgroupLimits::default()
+        };
+        let (_, value) = &limits.cgroup_writes()[1];
+        assert_eq!(value, "50000 100000");
+    }
+
+    #[test]
+    fn memory_max_and_pids_max_stringify_plainly() {
+        let limits = CgroupLimits {
+            memory_max_bytes: 268_435_456,
+            pids_max: 32,
+            ..CgroupLimits::default()
+        };
+        let writes = limits.cgroup_writes();
+        assert_eq!(writes[0].1, "268435456");
+        assert_eq!(writes[2].1, "32");
+    }
+
+    #[test]
+    fn to_hex_empty_slice_is_empty_string() {
+        assert_eq!(to_hex(&[]), "");
+    }
+
+    #[test]
+    fn to_hex_zero_pads_single_digit_bytes() {
+        assert_eq!(to_hex(&[0x00]), "00");
+        assert_eq!(to_hex(&[0x02]), "02");
+    }
+
+    #[test]
+    fn to_hex_is_lowercase() {
+        assert_eq!(to_hex(&[0xab, 0xcd, 0xef]), "abcdef");
+    }
+
+    #[test]
+    fn to_hex_32_byte_identity_has_expected_length_and_content() {
+        let identity: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let hex = to_hex(&identity);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(&hex[0..6], "000102");
+        assert_eq!(&hex[hex.len() - 6..], "1d1e1f");
+    }
 }

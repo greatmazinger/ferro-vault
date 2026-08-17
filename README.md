@@ -123,13 +123,21 @@ ls -la /proc/1/fd   # shows: N -> /memfd:ferrovault-identity (deleted)
 
 FerroVault does not fetch, build, or manage container images — no OCI, no image format, no network calls from the code itself. The container's root filesystem is a small tree you assemble by hand, once, before running the manager. It lives at `./rootfs/` (i.e. `/workspace/rootfs` inside the dev container), is gitignored, and survives the dev container being deleted and recreated since it lives in the bind-mounted repo directory rather than inside the container.
 
-Build it around a single static [BusyBox](https://busybox.net/) binary — verify the download's checksum against BusyBox's published release before trusting it:
+Build it around a single static [BusyBox](https://busybox.net/) binary. As of this writing, the newest prebuilt static binary published at busybox.net is 1.35.0 (2022-01-17); check [the binaries index](https://busybox.net/downloads/binaries/) for anything newer before using this. Note there's no checksum file published alongside it — this is trusting `busybox.net` over HTTPS with no independent checksum to verify against, not a verified download:
 
 ```bash
 mkdir -p rootfs/{bin,proc,dev,etc,tmp}
-curl -L -o rootfs/bin/busybox https://busybox.net/downloads/binaries/<version>/busybox-x86_64
+curl -L -o rootfs/bin/busybox https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
 chmod +x rootfs/bin/busybox
-ln -s busybox rootfs/bin/sh
+
+# BusyBox dispatches by the name it's invoked as (argv[0]), so each command
+# you want available needs its own symlink — `sh` alone isn't enough. `echo`
+# doesn't need one; it's a built-in of BusyBox's ash shell itself. This list
+# covers what README's verification steps and test.sh actually run; add more
+# the same way if you need other commands inside the container.
+for applet in sh ls touch cat ps; do
+    ln -s busybox "rootfs/bin/$applet"
+done
 
 # Minimal device nodes BusyBox's sh expects for interactive use.
 # mknod requires root — inside the Podman dev container you already are root,
