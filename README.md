@@ -24,6 +24,7 @@ Container: Entered new PID namespace. I am PID 1.
 Container: pivoted into isolated rootfs at /workspace/rootfs (now read-only).
 Container: /proc mounted. Only this namespace's processes are visible.
 Container: Identity received — 0x2ac063390d6602fe6dd750a44f3609b6...
+Container: seccomp filter installed — 56 syscalls allowed, everything else kills the process.
 ```
 
 The container then drops into a minimal `sh` (BusyBox) shell for inspection.
@@ -103,6 +104,17 @@ ls -la /proc/1/fd   # shows: N -> /memfd:ferrovault-identity (deleted)
 ```
 
 `(deleted)` is correct — a memfd has no filesystem path. The file exists only as long as open file descriptors reference it.
+
+### 5. Syscall filtering (seccomp)
+
+As the last step before `execvp`, FerroVault installs a seccomp-BPF filter confining the entrypoint (and anything it forks or execs from then on) to an allowlist of 56 syscalls. The filter checks two things per syscall: that the calling process's syscall-table architecture is x86-64 (rejecting the classic 32-bit-ABI confusion attack), then the syscall number itself against the allowlist. Anything that falls through both is killed via `SECCOMP_RET_KILL_PROCESS` — a disallowed syscall terminates that process outright rather than failing gracefully with an error code.
+
+The allowlist wasn't guessed: it comes from running the exact BusyBox build used in `./rootfs/` under `strace -f`, twice — once through the same command sequence `test.sh` and this README's walkthrough exercise, fed over a plain pipe, and once under a real pty. Those two traces disagree: a piped, non-interactive shell never touches job-control syscalls like `setpgid`/`getpgid`, but a real interactive terminal session does, immediately, before ever showing a prompt. A filter built from only the piped trace let `test.sh` pass while silently killing the shell the moment you ran the manager in an actual terminal — both traces are folded into the allowlist now, plus `chdir`, found afterward by hand: `cd` is an `ash` builtin that calls `chdir()` directly in the shell's own process rather than forking a child, so it killed the shell itself rather than just a forked command. It only covers what `/bin/sh` and the `ls`/`cat`/`touch`/`ps`/`grep` applets provisioned above actually need in these scenarios — running something outside that (a different applet, or one of those same applets doing something none of this exercised) can hit an unallowed syscall and get killed. That's expected, not a bug: the filter is scoped to what's documented and tested here, not a general-purpose shell environment.
+
+Verify from inside the container:
+```bash
+cat /proc/1/status   # Seccomp: field reads 2 (SECCOMP_MODE_FILTER)
+```
 
 ## Prior art
 
