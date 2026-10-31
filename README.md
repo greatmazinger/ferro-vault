@@ -1,6 +1,6 @@
 # FerroVault
 
-A zero-trust ephemeral sandbox runtime written in Rust, built from raw Linux kernel primitives — no Docker, no OCI, no container runtime libraries.
+A zero-trust ephemeral sandbox runtime written in Rust, built from raw Linux kernel primitives.
 
 FerroVault demonstrates how modern container isolation actually works beneath the abstractions, implementing namespace isolation, filesystem containment, resource enforcement, and in-memory identity injection from scratch.
 
