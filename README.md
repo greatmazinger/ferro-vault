@@ -120,6 +120,18 @@ Verify from inside the container:
 cat /proc/1/status   # Seccomp: field reads 2 (SECCOMP_MODE_FILTER)
 ```
 
+## Known limitations
+
+FerroVault isolates PID, mount, IPC, and network namespaces, plus filesystem, cgroups, and syscalls — but it's not a production container runtime. Gaps that are known and not yet addressed:
+
+- **No user namespace (`CLONE_NEWUSER`) / rootless support.** The container's root is the host's real root (uid 0), not a mapped, unprivileged uid. This is the biggest remaining gap toward a genuine zero-trust claim, and the next planned feature.
+- **No multi-container orchestration.** The manager spawns exactly one hardcoded container per run — there's no config format, no "AppIdentityGroup" concept, no way to run more than one container at a time.
+- **`/dev` and `/tmp` are empty mount points**, not a `devtmpfs`/`tmpfs`. Only the hand-created device nodes (`null`, `zero`, `tty`) exist; nothing else under `/dev` works, and nothing written to `/tmp` is actually tmpfs-backed (the root is read-only, so writes there fail anyway).
+- **The rootfs provisioning list is missing the `grep` applet** even though this README's own walkthrough and `test.sh` both use piped `grep`-style filtering elsewhere — a documentation nit, not a code bug.
+- **No `?`-operator error propagation.** Every failure path is a `panic!` or a manual `exit()`/`raise()`; this is low-urgency since it doesn't change behavior, just ergonomics.
+
+None of these are hidden defects — they're scope boundaries for a from-scratch primitives demo, not a general-purpose runtime, and they're tracked here so the gap between "what's verified above" and "what a real container runtime needs" stays honest.
+
 ## Prior art
 
 | Primitive | Credit |
