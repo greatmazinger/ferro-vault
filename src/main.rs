@@ -186,10 +186,13 @@ fn setup_namespaces_and_spawn() {
     }
     println!("Container: Assigned to cgroup (PID {}).", my_pid);
 
-    // NEWNS and NEWIPC take effect immediately for the calling process.
-    // NEWPID creates the namespace but does NOT move the caller into it —
-    // only the next forked child enters it as PID 1.
-    let flags = CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWIPC;
+    // NEWNS, NEWIPC, and NEWNET take effect immediately for the calling
+    // process. NEWPID creates the namespace but does NOT move the caller
+    // into it — only the next forked child enters it as PID 1.
+    let flags = CloneFlags::CLONE_NEWPID
+        | CloneFlags::CLONE_NEWNS
+        | CloneFlags::CLONE_NEWIPC
+        | CloneFlags::CLONE_NEWNET;
 
     if let Err(e) = unshare(flags) {
         eprintln!("Container: unshare failed: {}", e);

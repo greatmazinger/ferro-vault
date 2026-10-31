@@ -33,20 +33,24 @@ The container then drops into a minimal `sh` (BusyBox) shell for inspection.
 
 ### 1. Linux namespaces
 
-Three namespaces are created via `unshare(2)` before the container process starts:
+Four namespaces are created via `unshare(2)` before the container process starts:
 
 | Namespace | Flag | Effect |
 |---|---|---|
 | PID | `CLONE_NEWPID` | Container processes are invisible to the host; the entrypoint runs as PID 1 |
 | Mount | `CLONE_NEWNS` | Mount operations are private; changes do not propagate to the host |
 | IPC | `CLONE_NEWIPC` | Isolated System V IPC — no shared memory segments with the host |
+| Network | `CLONE_NEWNET` | Isolated network stack — no interfaces, no routes, no connectivity to the host or outside network |
 
 **Note on `CLONE_NEWPID`:** `unshare(CLONE_NEWPID)` creates the namespace but does not move the calling process into it — only the next forked child enters it as PID 1. FerroVault uses a double-fork pattern to handle this correctly.
+
+**Note on `CLONE_NEWNET`:** a fresh network namespace always has a `lo` (loopback) interface, but it starts administratively down — FerroVault doesn't bring it up or configure anything else, since nothing here needs networking at all. `lo` existing-but-down is expected, not a bug.
 
 Verify from inside the container:
 ```bash
 echo $$   # 1 — the entrypoint is PID 1 in its own namespace
 ps        # only this shell and whatever you run under it — no host processes
+cat /proc/net/dev   # only an `lo:` line — no host interfaces (eth0, etc.)
 ```
 
 ### 2. Filesystem isolation
@@ -220,6 +224,9 @@ The manager prints its startup transcript (identity, cgroup, namespace setup, pi
 echo $$                          # 1
 ps                                # only this shell / whatever you run — no host processes
 
+# Network namespace
+cat /proc/net/dev                 # only an `lo:` line — no host interfaces
+
 # Filesystem isolation
 ls -la /                          # only bin, dev, proc, tmp, etc — no host directories
 ls /home 2>&1                     # No such file or directory — host tree is unreachable
@@ -231,6 +238,9 @@ ls -la /proc/1/fd                 # N -> /memfd:ferrovault-identity (deleted)
 
 # Resource limits (partial view — /sys isn't in this rootfs; rest is step 3)
 cat /proc/self/cgroup             # 0::/ferrovault
+
+# Syscall filtering
+cat /proc/1/status                # Seccomp: field reads 2
 ```
 
 ### 3. From a second shell — check the enforced cgroup values
@@ -262,4 +272,4 @@ From the second shell, confirm the cgroup directory is actually gone:
 ls /sys/fs/cgroup/ferrovault   # No such file or directory
 ```
 
-If every check in steps 2–4 matches, all four isolation layers — namespaces, filesystem containment, resource limits, and identity injection — are working end-to-end for that run.
+If every check in steps 2–4 matches, all isolation layers — namespaces (PID/mount/IPC/network), filesystem containment, resource limits, identity injection, and syscall filtering — are working end-to-end for that run.

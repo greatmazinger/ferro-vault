@@ -106,6 +106,7 @@ echo "-- running checks from inside the container --"
     echo 'ls -la /proc/1/fd'
     echo 'cat /proc/self/cgroup'
     echo 'cat /proc/1/status'
+    echo 'cat /proc/net/dev'
 } >&"$FIFO_FD"
 
 sleep 1 # give the container time to run the above before we read cgroup files and exit it
@@ -131,6 +132,7 @@ check "filesystem isolation: root filesystem is read-only"    'Read-only file sy
 check "identity injection: sealed memfd present at /proc/1/fd" 'memfd:ferrovault-identity'
 check "cgroup membership: container is in /ferrovault"        '0::/ferrovault'
 check "seccomp: filter active on PID 1"                       'Seccomp:[[:space:]]*2'
+check "network namespace: only lo interface present"          'lo:[[:space:]]*[0-9]'
 check "manager: container exited cleanly"                     'Container exited with status'
 check "manager: cgroup directory removed after exit"          'Cgroup removed'
 
